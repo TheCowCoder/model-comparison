@@ -1,0 +1,5 @@
+{
+  "name": "AI Model Comparison",
+  "description": "An AI model comparison platform with dynamic benchmarks and local storage.",
+  "requestFramePermissions": []
+}

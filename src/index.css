@@ -1,0 +1,11 @@
+@import "tailwindcss";
+
+@layer utilities {
+  .custom-caret-red {
+    caret-color: #ef4444;
+  }
+  .custom-caret-blue {
+    caret-color: #3b82f6;
+  }
+}
+
