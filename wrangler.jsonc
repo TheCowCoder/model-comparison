@@ -1,6 +1,6 @@
 {
   "$schema": "./node_modules/wrangler/config-schema.json",
-  "name": "ai-model-comparison",
+  "name": "model-comparison",
   "main": "src/worker.ts",
   "compatibility_date": "2026-03-10",
   "assets": {
