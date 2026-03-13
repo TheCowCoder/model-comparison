@@ -44,8 +44,40 @@ export function calculateComprehensiveScore(intelligence: number, speed: number,
   return clamp((intelligence * 0.5) + (speed * 0.3) + (contextScore * 0.2), 0, 100);
 }
 
-export function calculateHumanUnderstanding(model: Model): number {
-  const benchmarkWeights: Array<{ id: string; weight: number }> = [
+function computeDynamicStat(
+  model: Model,
+  configs: Array<{ id: string; weight: number; isElo?: boolean; maxScale?: number }>,
+  hardcodedFallback: number
+): number {
+  let totalWeight = 0;
+  let weightedSum = 0;
+
+  for (const { id, weight, isElo, maxScale } of configs) {
+    const value = parseScoreValue(model.scores[id]);
+    if (value !== null) {
+      let normalized = value;
+      if (isElo && maxScale) {
+        normalized = (value / maxScale) * 100;
+      } else if (maxScale) {
+        normalized = (value / maxScale) * 100;
+      }
+      
+      weightedSum += clamp(normalized, 0, 100) * weight;
+      totalWeight += weight;
+    }
+  }
+
+  if (totalWeight > 0) {
+    // Base benchmark average
+    const avg = weightedSum / totalWeight;
+    // Ensure scores are spread beautifully across 50-95 based on realistic distributions
+    return clamp((avg * 0.8) + 35, 0, 100);
+  }
+  return clamp(hardcodedFallback, 0, 100);
+}
+
+export function calculateHumanUnderstanding(model: Model, intelligence: number): number {
+  const benchmarkWeights = [
     { id: 'hle', weight: 1.5 },
     { id: 'gpqa', weight: 1.2 },
     { id: 'mmmu', weight: 1.3 },
@@ -65,38 +97,75 @@ export function calculateHumanUnderstanding(model: Model): number {
     }
   }
 
-  const intelligence = model.stats?.intelligence ?? 50;
   if (totalWeight > 0) {
     const benchmarkComponent = weightedSum / totalWeight;
-    return Math.min(100, benchmarkComponent * 0.6 + intelligence * 0.4);
+    // Mix benchmark average with the intelligence calculation to get a tuned rating
+    return clamp(benchmarkComponent * 0.5 + intelligence * 0.45 + 5, 0, 100);
   }
 
-  return Math.min(100, intelligence * 0.85);
+  return clamp(intelligence * 0.85, 0, 100);
+}
+
+export function calculateIntelligence(model: Model): number {
+  return computeDynamicStat(model, [
+    { id: 'arc', weight: 1.5 },
+    { id: 'gpqa', weight: 1.2 },
+    { id: 'hle', weight: 1.5 },
+    { id: 'mmmu', weight: 1.0 },
+    { id: 'mmmlu', weight: 0.8 }
+  ], model.stats?.intelligence ?? 50);
+}
+
+export function calculateFrontend(model: Model): number {
+  return computeDynamicStat(model, [
+    { id: 'browsecomp', weight: 1.5 },
+    { id: 'swe-verified', weight: 1.2 },
+    { id: 'swe-pro', weight: 1.0 },
+    { id: 'mcp', weight: 1.0 }
+  ], model.stats?.frontend ?? 45);
+}
+
+export function calculateBackend(model: Model): number {
+  return computeDynamicStat(model, [
+    { id: 'terminal', weight: 1.5 },
+    { id: 'scicode', weight: 1.2 },
+    { id: 'apex', weight: 1.0 },
+    { id: 't2', weight: 1.0 },
+    { id: 'livecode', weight: 1.2, isElo: true, maxScale: 3500 },
+    { id: 'gdpval', weight: 1.0, isElo: true, maxScale: 2000 }
+  ], model.stats?.backend ?? 47.5);
+}
+
+export function calculateSpeed(model: Model, intelligence: number): number {
+  // Try to use a speed-related stat if any, otherwise fallback to inverse of intelligence with modifiers
+  // MRCR (Long context) can be a proxy for how fast they process large contexts, or we just rely on name
+  let speed = 100 - (intelligence * 0.5);
+  const idLower = model.name.toLowerCase();
+  
+  if (idLower.includes('groq') || idLower.includes('fast') || idLower.includes('edge') || 
+      idLower.includes('lite') || idLower.includes('mini') || idLower.includes('flash') || 
+      idLower.includes('8b') || idLower.includes('haiku')) {
+    speed += 30;
+  }
+  
+  const value = parseScoreValue(model.scores['mrcr']);
+  if (value !== null) {
+    // Let mrcr score slightly boost speed assumption if very high
+    speed += (value / 100) * 10;
+  }
+  
+  return clamp(speed, 10, 100);
 }
 
 export function normalizeModelStats(model: Model): Model {
-  if (!model.stats) {
-    return {
-      ...model,
-      stats: {
-        humanUnderstanding: 0,
-        intelligence: 50,
-        speed: 50,
-        frontend: 45,
-        backend: 47.5,
-        comprehensiveScore: 0,
-        contextLength: 128000,
-        pricePer1M: 0,
-      },
-    };
-  }
-
-  const intelligence = clamp(toFiniteNumber(model.stats.intelligence, 50), 0, 100);
-  const speed = clamp(toFiniteNumber(model.stats.speed, 50), 0, 100);
-  const frontend = clamp(toFiniteNumber(model.stats.frontend, intelligence * 0.9), 0, 100);
-  const backend = clamp(toFiniteNumber(model.stats.backend, intelligence * 0.95), 0, 100);
-  const contextLength = Math.max(1, Math.round(toFiniteNumber(model.stats.contextLength, 128000)));
-  const pricePer1M = Math.max(0, toFiniteNumber(model.stats.pricePer1M, 0));
+  // If baseline stats exist we use them for missing values, else 50, but primary source is dynamic calculation.
+  const intelligence = clamp(calculateIntelligence(model), 0, 100);
+  const speed = clamp(calculateSpeed(model, intelligence), 0, 100);
+  const frontend = clamp(calculateFrontend(model), 0, 100);
+  const backend = clamp(calculateBackend(model), 0, 100);
+  
+  const contextLength = Math.max(1, Math.round(toFiniteNumber(model.stats?.contextLength, 128000)));
+  const pricePer1M = Math.max(0, toFiniteNumber(model.stats?.pricePer1M, 0));
 
   const withBaseStats: Model = {
     ...model,
@@ -113,7 +182,7 @@ export function normalizeModelStats(model: Model): Model {
     },
   };
 
-  const humanUnderstanding = clamp(calculateHumanUnderstanding(withBaseStats), 0, 100);
+  const humanUnderstanding = clamp(calculateHumanUnderstanding(withBaseStats, intelligence), 0, 100);
   const comprehensiveScore = calculateComprehensiveScore(intelligence, speed, contextLength);
 
   return {

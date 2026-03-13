@@ -175,7 +175,20 @@ export const ParallelTerminal: React.FC<ParallelTerminalProps> = ({
       addLog({ message: `scraping ${model.name}...`, type: 'info', color: scraper.color, prefix: `${scraper.emoji} ${scraper.name}` });
 
       try {
-        const scores = await scrapeBenchmarksForModel(model.name, getBenchmarks(), signal);
+        const scores = await scrapeBenchmarksForModel(
+          model.name,
+          getBenchmarks(),
+          signal,
+          model.id,
+          (attempt, delayMs) => {
+            addLog({
+              message: `rate limited on ${model.name}; retry ${attempt} in ${Math.round(delayMs / 1000)}s`,
+              type: 'error',
+              color: scraper.color,
+              prefix: `${scraper.emoji} ${scraper.name}`,
+            });
+          },
+        );
         if (signal.aborted) break;
 
         await onApply(model.id, scores);

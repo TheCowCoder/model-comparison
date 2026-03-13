@@ -14,13 +14,23 @@ if (!dbName) {
 const sourcePath = resolve(process.cwd(), 'benchmarks_data.json');
 const tempPath = resolve(process.cwd(), '.tmp-seed.sql');
 const raw = readFileSync(sourcePath, 'utf8');
-const escaped = raw.replace(/'/g, "''");
+const chunkSize = 50000;
+const chunks = [];
+
+for (let index = 0; index < raw.length; index += chunkSize) {
+  chunks.push(raw.slice(index, index + chunkSize));
+}
+
+const escapeSql = (value) => value.replace(/'/g, "''");
 
 writeFileSync(
   tempPath,
   [
     'CREATE TABLE IF NOT EXISTS app_state (key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);',
-    `INSERT OR REPLACE INTO app_state (key, value, updated_at) VALUES ('primary', '${escaped}', CURRENT_TIMESTAMP);`,
+    'CREATE TABLE IF NOT EXISTS app_state_chunks (state_key TEXT NOT NULL, part_index INTEGER NOT NULL, chunk TEXT NOT NULL, PRIMARY KEY (state_key, part_index));',
+    "DELETE FROM app_state WHERE key = 'primary';",
+    "DELETE FROM app_state_chunks WHERE state_key = 'primary';",
+    ...chunks.map((chunk, index) => `INSERT INTO app_state_chunks (state_key, part_index, chunk) VALUES ('primary', ${index}, '${escapeSql(chunk)}');`),
   ].join('\n')
 );
 

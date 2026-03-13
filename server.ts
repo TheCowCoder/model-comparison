@@ -7,7 +7,10 @@ import fs from 'fs/promises';
 import path from 'path';
 import { createServer as createViteServer } from 'vite';
 import { sanitizeAppState, initialData } from './src/lib/appState';
-import { buildLeaderboardPrompt, buildScrapePrompt } from './src/lib/geminiPrompts';
+import { buildLeaderboardPrompt } from './src/lib/geminiPrompts';
+import { scrapeBenchmarksHybrid } from './src/lib/benchmarkScraper';
+import { filterModelsByLeaderboardRegex, inferLeaderboardQueryFallback, sanitizeLeaderboardQueryResult } from './src/lib/leaderboard';
+import { resolveLeaderboardSearchModel } from './src/lib/searchModels';
 
 const DATA_FILE = path.join(process.cwd(), 'benchmarks_data.json');
 const ADMIN_COOKIE = 'admin_session';
@@ -15,6 +18,8 @@ const SESSION_TTL_MS = 1000 * 60 * 60 * 24 * 7;
 const PORT = Number(process.env.PORT || 3000);
 const sessionSecret = process.env.SESSION_SECRET || process.env.ADMIN_PASSWORD || randomBytes(32).toString('hex');
 const rateLimitStore = new Map<string, { count: number; resetAt: number }>();
+const SCRAPE_RATE_LIMIT_MAX_REQUESTS = 90;
+const SCRAPE_RATE_LIMIT_WINDOW_MS = 60 * 1000;
 
 function base64UrlEncode(value: string) {
   return Buffer.from(value).toString('base64url');
@@ -108,6 +113,12 @@ function checkRateLimit(key: string, limit: number, windowMs: number) {
   return true;
 }
 
+function getRetryAfterSeconds(key: string) {
+  const current = rateLimitStore.get(key);
+  if (!current) return 60;
+  return Math.max(1, Math.ceil((current.resetAt - Date.now()) / 1000));
+}
+
 async function readStateFromDisk() {
   try {
     const data = await fs.readFile(DATA_FILE, 'utf-8');
@@ -134,68 +145,58 @@ function createGeminiClient() {
   return new GoogleGenAI({ apiKey });
 }
 
-async function parseLeaderboardQuery(query: string, models: any[], benchmarks: any[]) {
+async function parseLeaderboardQuery(query: string, models: any[], benchmarks: any[], searchModel?: string) {
   const ai = createGeminiClient();
-  const response = await ai.models.generateContent({
-    model: 'gemini-3-flash-preview',
-    contents: buildLeaderboardPrompt(query, models, benchmarks),
-    config: {
-      responseMimeType: 'application/json',
-      responseSchema: {
-        type: Type.OBJECT,
-        properties: {
-          benchmarkId: { type: Type.STRING, nullable: true },
-          modelIds: { type: Type.ARRAY, items: { type: Type.STRING } },
-        },
-      },
-    },
-  });
+  const fallback = inferLeaderboardQueryFallback(query, models, benchmarks);
 
   try {
-    const parsed = JSON.parse(response.text || '{}');
-    return {
-      benchmarkId: typeof parsed.benchmarkId === 'string' ? parsed.benchmarkId : null,
-      modelIds: Array.isArray(parsed.modelIds) ? parsed.modelIds.filter((value: unknown) => typeof value === 'string') : [],
-    };
-  } catch {
-    return { benchmarkId: null, modelIds: [] };
-  }
-}
-
-async function scrapeBenchmarksForModel(modelName: string, benchmarks: any[]) {
-  const ai = createGeminiClient();
-  const response = await ai.models.generateContent({
-    model: 'gemini-3-flash-preview',
-    contents: buildScrapePrompt(modelName, benchmarks),
-    config: {
-      responseMimeType: 'application/json',
-      responseSchema: {
-        type: Type.ARRAY,
-        items: {
+    const response = await ai.models.generateContent({
+      model: resolveLeaderboardSearchModel(searchModel),
+      contents: buildLeaderboardPrompt(query, models, benchmarks),
+      config: {
+        responseMimeType: 'application/json',
+        responseSchema: {
           type: Type.OBJECT,
           properties: {
-            benchmarkId: { type: Type.STRING },
-            score: { type: Type.STRING },
+            modelRegex: { type: Type.STRING, nullable: true },
+            sorts: {
+              type: Type.ARRAY,
+              items: {
+                type: Type.OBJECT,
+                properties: {
+                  kind: { type: Type.STRING },
+                  id: { type: Type.STRING },
+                  direction: { type: Type.STRING },
+                },
+              },
+            },
           },
         },
       },
-    },
-  });
+    });
 
-  try {
-    const parsed = JSON.parse(response.text || '[]');
-    const result: Record<string, string> = {};
-    if (Array.isArray(parsed)) {
-      for (const entry of parsed) {
-        if (typeof entry?.benchmarkId === 'string' && typeof entry?.score === 'string') {
-          result[entry.benchmarkId] = entry.score;
-        }
+    const parsed = JSON.parse(response.text || '{}');
+    const sanitized = sanitizeLeaderboardQueryResult(parsed, models, benchmarks);
+    const mergedSorts = [...sanitized.sorts];
+    for (const sort of fallback.sorts) {
+      if (!mergedSorts.some((entry) => entry.kind === sort.kind && entry.id === sort.id)) {
+        mergedSorts.push(sort);
       }
     }
-    return result;
+
+    return {
+      modelRegex: sanitized.modelRegex && filterModelsByLeaderboardRegex(models, sanitized.modelRegex).length > 0
+        ? sanitized.modelRegex
+        : fallback.modelRegex,
+      sorts: mergedSorts.length > 0 ? mergedSorts : fallback.sorts,
+    };
   } catch {
-    return {};
+    return fallback;
   }
+}
+
+async function scrapeBenchmarksForModel(modelName: string, benchmarks: any[], modelId?: string) {
+  return scrapeBenchmarksHybrid(modelName, benchmarks, modelId);
 }
 
 async function startServer() {
@@ -287,6 +288,7 @@ async function startServer() {
     const query = typeof req.body?.query === 'string' ? req.body.query.trim().slice(0, 400) : '';
     const models = Array.isArray(req.body?.models) ? req.body.models : [];
     const benchmarks = Array.isArray(req.body?.benchmarks) ? req.body.benchmarks : [];
+    const searchModel = typeof req.body?.searchModel === 'string' ? req.body.searchModel : undefined;
 
     if (!query) {
       res.status(400).json({ error: 'Query is required' });
@@ -294,7 +296,7 @@ async function startServer() {
     }
 
     try {
-      res.json(await parseLeaderboardQuery(query, models, benchmarks));
+      res.json(await parseLeaderboardQuery(query, models, benchmarks, searchModel));
     } catch (error) {
       console.error('Failed to parse leaderboard query', error);
       res.status(500).json({ error: 'Failed to parse leaderboard query' });
@@ -309,12 +311,14 @@ async function startServer() {
     }
 
     const rateKey = `scrape:${getClientKey(req)}`;
-    if (!checkRateLimit(rateKey, 12, 60 * 1000)) {
+    if (!checkRateLimit(rateKey, SCRAPE_RATE_LIMIT_MAX_REQUESTS, SCRAPE_RATE_LIMIT_WINDOW_MS)) {
+      res.setHeader('Retry-After', String(getRetryAfterSeconds(rateKey)));
       res.status(429).json({ error: 'Scrape rate limit reached. Please slow down.' });
       return;
     }
 
     const modelName = typeof req.body?.modelName === 'string' ? req.body.modelName.trim().slice(0, 160) : '';
+    const modelId = typeof req.body?.modelId === 'string' ? req.body.modelId.trim().slice(0, 200) : undefined;
     const benchmarks = Array.isArray(req.body?.benchmarks) ? req.body.benchmarks : [];
 
     if (!modelName) {
@@ -323,10 +327,11 @@ async function startServer() {
     }
 
     try {
-      res.json(await scrapeBenchmarksForModel(modelName, benchmarks));
+      res.json(await scrapeBenchmarksForModel(modelName, benchmarks, modelId));
     } catch (error) {
       console.error('Failed to scrape benchmarks', error);
-      res.status(500).json({ error: 'Failed to scrape benchmarks' });
+      const message = error instanceof Error ? error.message : 'Failed to scrape benchmarks';
+      res.status(500).json({ error: message });
     }
   });
 

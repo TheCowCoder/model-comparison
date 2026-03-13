@@ -1,17 +1,48 @@
-import { AppState, Benchmark, Model } from '../types';
+import { AppState, Benchmark, LeaderboardQueryResult, Model } from '../types';
+
+export class RequestError extends Error {
+  status: number;
+  retryAfterMs?: number;
+
+  constructor(message: string, status: number, retryAfterMs?: number) {
+    super(message);
+    this.name = 'RequestError';
+    this.status = status;
+    this.retryAfterMs = retryAfterMs;
+  }
+}
+
+function parseRetryAfterMs(value: string | null) {
+  if (!value) return undefined;
+
+  const seconds = Number(value);
+  if (Number.isFinite(seconds) && seconds > 0) {
+    return seconds * 1000;
+  }
+
+  const timestamp = Date.parse(value);
+  if (Number.isFinite(timestamp)) {
+    return Math.max(0, timestamp - Date.now());
+  }
+
+  return undefined;
+}
 
 async function request<T>(input: string, init?: RequestInit): Promise<T> {
+  const { signal, ...rest } = init || {};
   const response = await fetch(input, {
     credentials: 'include',
-    ...init,
+    ...rest,
+    ...(signal ? { signal } : {}),
     headers: {
       'Content-Type': 'application/json',
-      ...(init?.headers || {}),
+      ...(rest.headers || {}),
     },
   });
 
   if (!response.ok) {
     let message = `Request failed with status ${response.status}`;
+    const retryAfterMs = parseRetryAfterMs(response.headers.get('Retry-After'));
     try {
       const data = await response.json();
       if (data?.error) {
@@ -20,7 +51,7 @@ async function request<T>(input: string, init?: RequestInit): Promise<T> {
     } catch {
       // Ignore JSON parse errors and use the generic message.
     }
-    throw new Error(message);
+    throw new RequestError(message, response.status, retryAfterMs);
   }
 
   if (response.status === 204) {
@@ -60,16 +91,22 @@ export function logoutAdmin(): Promise<void> {
   return request<void>('/api/auth/logout', { method: 'POST' });
 }
 
-export function parseLeaderboardQueryRequest(query: string, models: Model[], benchmarks: Benchmark[]) {
-  return request<{ benchmarkId: string | null; modelIds: string[] }>('/api/leaderboard-query', {
+export function parseLeaderboardQueryRequest(query: string, models: Model[], benchmarks: Benchmark[], searchModel: string) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 25_000);
+
+  const slim = models.map(m => ({ id: m.id, name: m.name, subtitle: m.subtitle }));
+
+  return request<LeaderboardQueryResult>('/api/leaderboard-query', {
     method: 'POST',
-    body: JSON.stringify({ query, models, benchmarks }),
-  });
+    body: JSON.stringify({ query, models: slim, benchmarks, searchModel }),
+    signal: controller.signal,
+  }).finally(() => clearTimeout(timeout));
 }
 
-export function scrapeBenchmarksRequest(modelName: string, benchmarks: Benchmark[]) {
+export function scrapeBenchmarksRequest(modelName: string, benchmarks: Benchmark[], modelId?: string) {
   return request<Record<string, string>>('/api/scrape', {
     method: 'POST',
-    body: JSON.stringify({ modelName, benchmarks }),
+    body: JSON.stringify({ modelName, modelId, benchmarks }),
   });
 }

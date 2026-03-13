@@ -1,10 +1,15 @@
 import { GoogleGenAI, Type } from '@google/genai';
-import { buildLeaderboardPrompt, buildScrapePrompt } from './lib/geminiPrompts';
+import { buildLeaderboardPrompt } from './lib/geminiPrompts';
 import { initialData, sanitizeAppState } from './lib/appState';
+import { filterModelsByLeaderboardRegex, inferLeaderboardQueryFallback, sanitizeLeaderboardQueryResult } from './lib/leaderboard';
+import { resolveLeaderboardSearchModel } from './lib/searchModels';
+import { scrapeBenchmarksHybrid } from './lib/benchmarkScraper';
 
 const ADMIN_COOKIE = 'admin_session';
 const SESSION_TTL_MS = 1000 * 60 * 60 * 24 * 7;
 const rateLimitStore = new Map<string, { count: number; resetAt: number }>();
+const SCRAPE_RATE_LIMIT_MAX_REQUESTS = 90;
+const SCRAPE_RATE_LIMIT_WINDOW_MS = 60 * 1000;
 
 interface Env {
   DB: any;
@@ -117,14 +122,31 @@ function checkRateLimit(key: string, limit: number, windowMs: number) {
   return true;
 }
 
+function getRetryAfterSeconds(key: string) {
+  const current = rateLimitStore.get(key);
+  if (!current) return 60;
+  return Math.max(1, Math.ceil((current.resetAt - Date.now()) / 1000));
+}
+
 async function loadState(env: Env) {
   const row = await env.DB.prepare('SELECT value FROM app_state WHERE key = ?').bind('primary').first();
-  if (!row?.value) {
+  if (row?.value) {
+    try {
+      return sanitizeAppState(JSON.parse(row.value as string));
+    } catch {
+      return sanitizeAppState(initialData);
+    }
+  }
+
+  const chunkRows = await env.DB.prepare('SELECT chunk FROM app_state_chunks WHERE state_key = ? ORDER BY part_index ASC').bind('primary').all();
+  const chunks = Array.isArray(chunkRows.results) ? chunkRows.results : [];
+  if (chunks.length === 0) {
     return sanitizeAppState(initialData);
   }
 
   try {
-    return sanitizeAppState(JSON.parse(row.value as string));
+    const combined = chunks.map((entry: any) => String(entry.chunk || '')).join('');
+    return sanitizeAppState(JSON.parse(combined));
   } catch {
     return sanitizeAppState(initialData);
   }
@@ -132,9 +154,28 @@ async function loadState(env: Env) {
 
 async function saveState(env: Env, value: unknown) {
   const sanitized = sanitizeAppState(value);
-  await env.DB.prepare(
-    'INSERT OR REPLACE INTO app_state (key, value, updated_at) VALUES (?, ?, CURRENT_TIMESTAMP)'
-  ).bind('primary', JSON.stringify(sanitized)).run();
+  const serialized = JSON.stringify(sanitized);
+  const chunkSize = 50000;
+  const chunks: string[] = [];
+
+  for (let index = 0; index < serialized.length; index += chunkSize) {
+    chunks.push(serialized.slice(index, index + chunkSize));
+  }
+
+  const statements = [
+    env.DB.prepare('CREATE TABLE IF NOT EXISTS app_state (key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)'),
+    env.DB.prepare('CREATE TABLE IF NOT EXISTS app_state_chunks (state_key TEXT NOT NULL, part_index INTEGER NOT NULL, chunk TEXT NOT NULL, PRIMARY KEY (state_key, part_index))'),
+    env.DB.prepare('DELETE FROM app_state WHERE key = ?').bind('primary'),
+    env.DB.prepare('DELETE FROM app_state_chunks WHERE state_key = ?').bind('primary'),
+  ];
+
+  chunks.forEach((chunk, index) => {
+    statements.push(
+      env.DB.prepare('INSERT INTO app_state_chunks (state_key, part_index, chunk) VALUES (?, ?, ?)').bind('primary', index, chunk)
+    );
+  });
+
+  await env.DB.batch(statements);
   return sanitized;
 }
 
@@ -145,68 +186,60 @@ function createGeminiClient(env: Env) {
   return new GoogleGenAI({ apiKey: env.GEMINI_API_KEY });
 }
 
-async function parseLeaderboardQuery(env: Env, query: string, models: any[], benchmarks: any[]) {
+async function parseLeaderboardQuery(env: Env, query: string, models: any[], benchmarks: any[], searchModel?: string) {
   const ai = createGeminiClient(env);
-  const response = await ai.models.generateContent({
-    model: 'gemini-3-flash-preview',
-    contents: buildLeaderboardPrompt(query, models, benchmarks),
-    config: {
-      responseMimeType: 'application/json',
-      responseSchema: {
-        type: Type.OBJECT,
-        properties: {
-          benchmarkId: { type: Type.STRING, nullable: true },
-          modelIds: { type: Type.ARRAY, items: { type: Type.STRING } },
-        },
-      },
-    },
-  });
+  const fallback = inferLeaderboardQueryFallback(query, models, benchmarks);
+  const resolvedSearchModel = resolveLeaderboardSearchModel(searchModel);
 
   try {
-    const parsed = JSON.parse(response.text || '{}');
-    return {
-      benchmarkId: typeof parsed.benchmarkId === 'string' ? parsed.benchmarkId : null,
-      modelIds: Array.isArray(parsed.modelIds) ? parsed.modelIds.filter((value: unknown) => typeof value === 'string') : [],
-    };
-  } catch {
-    return { benchmarkId: null, modelIds: [] };
-  }
-}
-
-async function scrapeBenchmarksForModel(env: Env, modelName: string, benchmarks: any[]) {
-  const ai = createGeminiClient(env);
-  const response = await ai.models.generateContent({
-    model: 'gemini-3-flash-preview',
-    contents: buildScrapePrompt(modelName, benchmarks),
-    config: {
-      responseMimeType: 'application/json',
-      responseSchema: {
-        type: Type.ARRAY,
-        items: {
+    const response = await ai.models.generateContent({
+      model: resolvedSearchModel,
+      contents: buildLeaderboardPrompt(query, models, benchmarks),
+      config: {
+        responseMimeType: 'application/json',
+        responseSchema: {
           type: Type.OBJECT,
           properties: {
-            benchmarkId: { type: Type.STRING },
-            score: { type: Type.STRING },
+            modelRegex: { type: Type.STRING, nullable: true },
+            sorts: {
+              type: Type.ARRAY,
+              items: {
+                type: Type.OBJECT,
+                properties: {
+                  kind: { type: Type.STRING },
+                  id: { type: Type.STRING },
+                  direction: { type: Type.STRING },
+                },
+              },
+            },
           },
         },
       },
-    },
-  });
+    });
 
-  try {
-    const parsed = JSON.parse(response.text || '[]');
-    const result: Record<string, string> = {};
-    if (Array.isArray(parsed)) {
-      for (const entry of parsed) {
-        if (typeof entry?.benchmarkId === 'string' && typeof entry?.score === 'string') {
-          result[entry.benchmarkId] = entry.score;
-        }
+    const parsed = JSON.parse(response.text || '{}');
+    const sanitized = sanitizeLeaderboardQueryResult(parsed, models, benchmarks);
+    const mergedSorts = [...sanitized.sorts];
+    for (const sort of fallback.sorts) {
+      if (!mergedSorts.some((entry) => entry.kind === sort.kind && entry.id === sort.id)) {
+        mergedSorts.push(sort);
       }
     }
-    return result;
+
+    return {
+      modelRegex: sanitized.modelRegex && filterModelsByLeaderboardRegex(models, sanitized.modelRegex).length > 0
+        ? sanitized.modelRegex
+        : fallback.modelRegex,
+      sorts: mergedSorts.length > 0 ? mergedSorts : fallback.sorts,
+    };
   } catch {
-    return {};
+    return fallback;
   }
+}
+
+async function scrapeBenchmarksForModel(env: Env, modelName: string, benchmarks: any[], modelId?: string) {
+  void env;
+  return scrapeBenchmarksHybrid(modelName, benchmarks, modelId);
 }
 
 export default {
@@ -286,13 +319,14 @@ export default {
       const query = typeof body?.query === 'string' ? body.query.trim().slice(0, 400) : '';
       const models = Array.isArray(body?.models) ? body.models : [];
       const benchmarks = Array.isArray(body?.benchmarks) ? body.benchmarks : [];
+      const searchModel = typeof body?.searchModel === 'string' ? body.searchModel : undefined;
 
       if (!query) {
         return json({ error: 'Query is required' }, { status: 400 });
       }
 
       try {
-        return json(await parseLeaderboardQuery(env, query, models, benchmarks));
+        return json(await parseLeaderboardQuery(env, query, models, benchmarks, searchModel));
       } catch {
         return json({ error: 'Failed to parse leaderboard query' }, { status: 500 });
       }
@@ -305,12 +339,16 @@ export default {
       }
 
       const rateKey = `scrape:${getClientKey(request)}`;
-      if (!checkRateLimit(rateKey, 12, 60 * 1000)) {
-        return json({ error: 'Scrape rate limit reached. Please slow down.' }, { status: 429 });
+      if (!checkRateLimit(rateKey, SCRAPE_RATE_LIMIT_MAX_REQUESTS, SCRAPE_RATE_LIMIT_WINDOW_MS)) {
+        return json(
+          { error: 'Scrape rate limit reached. Please slow down.' },
+          { status: 429, headers: { 'Retry-After': String(getRetryAfterSeconds(rateKey)) } },
+        );
       }
 
       const body: any = await request.json();
       const modelName = typeof body?.modelName === 'string' ? body.modelName.trim().slice(0, 160) : '';
+      const modelId = typeof body?.modelId === 'string' ? body.modelId.trim().slice(0, 200) : '';
       const benchmarks = Array.isArray(body?.benchmarks) ? body.benchmarks : [];
 
       if (!modelName) {
@@ -318,9 +356,10 @@ export default {
       }
 
       try {
-        return json(await scrapeBenchmarksForModel(env, modelName, benchmarks));
-      } catch {
-        return json({ error: 'Failed to scrape benchmarks' }, { status: 500 });
+        return json(await scrapeBenchmarksForModel(env, modelName, benchmarks, modelId || undefined));
+      } catch (error) {
+        const message = error instanceof Error ? error.message : 'Failed to scrape benchmarks';
+        return json({ error: message }, { status: 500 });
       }
     }
 

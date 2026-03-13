@@ -13,9 +13,10 @@ export default function AdminView() {
   const { logout } = useAuth();
   const [isLoading, setIsLoading] = useState(false);
   const [searchTerm, setSearchTerm] = useState('');
-  const [isScraperOpen, setIsScraperOpen] = useState(false);
-  const [activeTab, setActiveTab] = useState<'models' | 'benchmarks' | 'benchmarks-config'>('models');
+  const [activeTab, setActiveTab] = useState<'models' | 'benchmarks' | 'scraper' | 'benchmarks-config' | 'import'>('models');
   const [publishStatus, setPublishStatus] = useState<string | null>(null);
+  const [importJson, setImportJson] = useState('');
+  const [importStatus, setImportStatus] = useState<{ type: 'success' | 'error', message: string } | null>(null);
 
   // Keep refs to always-current models/benchmarks so async callbacks never use stale closures
   const modelsRef = useRef(contextModels);
@@ -163,6 +164,79 @@ export default function AdminView() {
   });
   const scrapeProgress = totalPossibleScores > 0 ? Math.round((filledScores / totalPossibleScores) * 100) : 0;
 
+  const handleImport = async () => {
+    try {
+      const parsed = JSON.parse(importJson);
+      let newModels = [...contextModels];
+      let newBenchmarks = [...contextBenchmarks];
+      
+      if (parsed.benchmarks_catalog) {
+        Object.entries(parsed.benchmarks_catalog).forEach(([key, val]: any) => {
+          if (!newBenchmarks.find(b => b.id === key)) {
+            newBenchmarks.push({ id: key, name: val.name || key, subtext1: '', subtext2: '' });
+          }
+        });
+      }
+      
+      if (parsed.models && !Array.isArray(parsed.models)) {
+        Object.entries(parsed.models).forEach(([modelName, modelData]: any) => {
+          let existingModel = newModels.find(m => m.name.toLowerCase() === modelName.toLowerCase() || m.id === modelName);
+          if (!existingModel) {
+            existingModel = {
+              id: modelName.toLowerCase().replace(/[^a-z0-9]+/g, '-'),
+              name: modelName,
+              subtitle: modelData.provider || '',
+              scores: {}
+            };
+            newModels.push(existingModel);
+          }
+          
+          if (modelData.benchmarks) {
+            for (const [bk, bv] of Object.entries(modelData.benchmarks)) {
+              let strVal = String(bv);
+              if (typeof bv === 'number') {
+                if (parsed.benchmarks_catalog?.[bk]?.type === 'percentage') {
+                  strVal = bv + "%";
+                }
+                if (!strVal.includes('%') && bv <= 100 && bv > 0 && bv % 1 !== 0) {
+                  strVal = bv + "%";
+                }
+              }
+              existingModel.scores[bk] = strVal;
+            }
+          }
+        });
+      }
+
+      if (Array.isArray(parsed.models)) {
+        parsed.models.forEach((m: any) => {
+          const existing = newModels.find(em => em.id === m.id || em.name === m.name);
+          if (existing) {
+            existing.scores = { ...existing.scores, ...(m.scores || {}) };
+            if (m.stats) existing.stats = { ...existing.stats, ...m.stats };
+          } else {
+            newModels.push(m);
+          }
+        });
+      }
+      
+      if (Array.isArray(parsed.benchmarks)) {
+        parsed.benchmarks.forEach((b: any) => {
+          if (!newBenchmarks.find(eb => eb.id === b.id)) {
+            newBenchmarks.push(b);
+          }
+        });
+      }
+
+      setContextModels(newModels);
+      setContextBenchmarks(newBenchmarks);
+      await persistData(newModels, newBenchmarks);
+      setImportStatus({ type: 'success', message: 'Import successful! Data merged.' });
+    } catch (e: any) {
+      setImportStatus({ type: 'error', message: 'Import failed: ' + e.message });
+    }
+  };
+
   return (
     <div className="min-h-screen bg-neutral-50 p-4 md:p-8 font-sans">
       <div className="max-w-7xl mx-auto">
@@ -178,7 +252,7 @@ export default function AdminView() {
           </div>
           <div className="flex items-center gap-3 w-full md:w-auto">
             <button
-              onClick={() => setIsScraperOpen(true)}
+              onClick={() => setActiveTab('scraper')}
               className="flex items-center gap-2 bg-purple-600 text-white px-4 py-2 rounded-lg hover:bg-purple-700 transition-colors whitespace-nowrap"
             >
               <Sparkles size={16} /> AI Scrape Benchmarks
@@ -246,14 +320,26 @@ export default function AdminView() {
             Benchmarks
           </button>
           <button 
+            className={`pb-2 px-1 font-medium text-sm transition-colors ${activeTab === 'scraper' ? 'border-b-2 border-blue-600 text-blue-600' : 'text-neutral-500 hover:text-neutral-800'}`}
+            onClick={() => setActiveTab('scraper')}
+          >
+            Scraper
+          </button>
+          <button 
             className={`pb-2 px-1 font-medium text-sm transition-colors ${activeTab === 'benchmarks-config' ? 'border-b-2 border-blue-600 text-blue-600' : 'text-neutral-500 hover:text-neutral-800'}`}
             onClick={() => setActiveTab('benchmarks-config')}
           >
             Benchmarks to Include
           </button>
+          <button 
+            className={`pb-2 px-1 font-medium text-sm transition-colors ${activeTab === 'import' ? 'border-b-2 border-blue-600 text-blue-600' : 'text-neutral-500 hover:text-neutral-800'}`}
+            onClick={() => setActiveTab('import')}
+          >
+            Import
+          </button>
         </div>
 
-        <div className="bg-white border border-neutral-200 rounded-xl shadow-sm overflow-hidden flex flex-col h-[75vh]">
+        <div className="bg-white border border-neutral-200 rounded-xl shadow-sm overflow-hidden flex flex-col h-[75vh] min-h-0">
           {activeTab === 'models' && (
             <>
               <div className="p-4 border-b border-neutral-200 flex items-center gap-3 bg-neutral-50">
@@ -487,17 +573,49 @@ export default function AdminView() {
               </div>
             </div>
           )}
-        </div>
+
+          {activeTab === 'scraper' && (
+            <div className="p-4 md:p-6 overflow-hidden flex-1 min-h-0 bg-neutral-50">
+              <ScraperModal
+                embedded
+                isOpen={true}
+                onClose={() => setActiveTab('models')}
+                models={contextModels}
+                benchmarks={contextBenchmarks}
+                onApply={handleApplyScrapedScores}
+                getModels={getModels}
+                getBenchmarks={getBenchmarks}
+              />
+            </div>
+          )}
+          {activeTab === 'import' && (
+            <div className="flex-1 flex flex-col p-6 min-h-0 bg-white">
+              <h2 className="text-lg font-semibold mb-4">Import Data</h2>
+              <p className="text-sm text-neutral-600 mb-4">
+                Paste JSON data below. This will merge the new scores with existing models and keep all old values (like the current Gemini 2.5 Pro scores).
+              </p>
+              <textarea
+                className="w-full flex-1 border border-neutral-300 rounded p-3 font-mono text-sm leading-relaxed mb-4 focus:ring-2 focus:ring-blue-500 focus:border-transparent resize-none"
+                placeholder="Paste JSON here..."
+                value={importJson}
+                onChange={e => setImportJson(e.target.value)}
+              />
+              <div className="flex items-center gap-4">
+                <button
+                  onClick={handleImport}
+                  className="bg-blue-600 hover:bg-blue-700 text-white font-medium py-2 px-6 rounded transition-colors"
+                >
+                  Merge and Save
+                </button>
+                {importStatus && (
+                  <span className={`text-sm font-medium ${importStatus.type === 'success' ? 'text-green-600' : 'text-red-500'}`}>
+                    {importStatus.message}
+                  </span>
+                )}
+              </div>
+            </div>
+          )}        </div>
       </div>
-      <ScraperModal 
-        isOpen={isScraperOpen} 
-        onClose={() => setIsScraperOpen(false)} 
-        models={contextModels} 
-        benchmarks={contextBenchmarks}
-        onApply={handleApplyScrapedScores}
-        getModels={getModels}
-        getBenchmarks={getBenchmarks}
-      />
     </div>
   );
 }

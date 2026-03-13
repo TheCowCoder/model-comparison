@@ -58,7 +58,7 @@ npx wrangler login
 ### 2. Create the D1 database
 
 ```bash
-npx wrangler d1 create ai-model-comparison
+npx wrangler d1 create model-comparison
 ```
 
 Cloudflare will print a `database_id`.
@@ -68,13 +68,13 @@ Open [wrangler.jsonc](wrangler.jsonc) and replace `REPLACE_WITH_YOUR_D1_DATABASE
 ### 3. Create the D1 table
 
 ```bash
-npx wrangler d1 execute ai-model-comparison --remote --file=./schema.sql
+npx wrangler d1 execute model-comparison --remote --file=./schema.sql
 ```
 
 ### 4. Seed the existing benchmark data into D1
 
 ```bash
-npm run cf:seed -- ai-model-comparison --remote
+npm run cf:seed -- model-comparison --remote
 ```
 
 ### 5. Add production secrets
@@ -91,7 +91,7 @@ npx wrangler secret put SESSION_SECRET
 npm run cf:deploy
 ```
 
-Cloudflare will return a production URL like `https://ai-model-comparison.<your-subdomain>.workers.dev`.
+Cloudflare will return a production URL like `https://model-comparison.<your-subdomain>.workers.dev`.
 
 ## Click-By-Click Cloudflare Dashboard Flow
 
@@ -106,7 +106,7 @@ If you want the web-click path instead of mostly terminal:
 7. Set the output directory to `dist`.
 8. Finish the import.
 9. In Cloudflare Dashboard, open `Storage & Databases`.
-10. Create a new `D1` database named `ai-model-comparison`.
+10. Create a new `D1` database named `model-comparison`.
 11. Copy the database ID into [wrangler.jsonc](wrangler.jsonc).
 12. In the Worker project settings, add secrets named `GEMINI_API_KEY`, `ADMIN_PASSWORD`, and `SESSION_SECRET`.
 13. Redeploy the project.
@@ -120,6 +120,43 @@ The dashboard can create the app and database, but seeding the existing JSON dat
 2. `/compare` public head-to-head comparison
 3. `/leaderboards` public rankings and natural-language search
 4. `/admin` password-protected admin dashboard
+
+## Prompt Tuning
+
+Prompt text now lives in the top-level [prompts](prompts) directory so you can tune the leaderboard search and scraping behavior without editing inline TypeScript strings.
+
+Current prompt files:
+
+1. [prompts/leaderboard-search/prompt.txt](prompts/leaderboard-search/prompt.txt)
+2. [prompts/benchmark-scrape/prompt.txt](prompts/benchmark-scrape/prompt.txt)
+
+Generated runtime module:
+
+1. [src/lib/generated/prompts.ts](src/lib/generated/prompts.ts)
+
+Build the generated module after editing prompt files:
+
+```bash
+npm run prompts:build
+```
+
+The project also runs that step automatically before `dev`, `build`, and `lint`.
+
+Supported placeholder style inside prompt files:
+
+1. `{{query}}`
+2. `{{availableModels}}`
+3. `{{availableBenchmarks}}`
+4. `{{availableStats}}`
+5. `{{modelName}}`
+6. `{{benchmarkDescriptions}}`
+7. `{{benchmarkIds}}`
+
+Leaderboard search tuning notes:
+
+1. Keep the response contract as strict JSON with `modelIds` and `sorts`.
+2. Keep examples aligned with real stat and benchmark IDs such as `speed`, `browsecomp`, and `humanUnderstanding`.
+3. If you want ranking queries like “blazingly fast models” to sort correctly, keep at least one example that maps speed- or latency-language onto the `speed` stat.
 
 ## Security and Robustness Changes Included
 

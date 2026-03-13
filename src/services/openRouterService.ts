@@ -33,7 +33,7 @@ export const fetchOpenRouterModels = async (): Promise<Model[]> => {
       const idLower = apiModel.id.toLowerCase();
       const offset = deterministicOffset(apiModel.id, 10);
 
-      if (idLower.includes('opus') || idLower.includes('gpt-4') || idLower.includes('sonnet-3.5') || idLower.includes('gemini-1.5-pro') || idLower.includes('gemini-2') || idLower.includes('claude-3.5') || idLower.includes('o1')) {
+      if (idLower.includes('opus') || idLower.includes('gpt-4') || idLower.includes('gpt-5') || idLower.includes('sonnet-3.5') || idLower.includes('gemini-1.5-pro') || idLower.includes('gemini-2') || idLower.includes('gemini-3') || idLower.includes('claude-3.5') || idLower.includes('o1') || idLower.includes('o3') || idLower.includes('o4')) {
         intelligence = 92 + deterministicOffset(apiModel.id, 6); // Top tier
       } else if (idLower.includes('sonnet') || idLower.includes('gpt-4o-mini') || idLower.includes('gemini-1.5-flash') || idLower.includes('70b') || idLower.includes('72b') || idLower.includes('llama-3.1-405b')) {
         intelligence = 80 + deterministicOffset(apiModel.id, 10); // High tier

@@ -10,6 +10,10 @@
     "clean": "rm -rf dist",
     "lint": "tsc --noEmit",
     "start": "node server.ts",
+    "predev": "npm run prompts:build",
+    "prebuild": "npm run prompts:build",
+    "prelint": "npm run prompts:build",
+    "prompts:build": "node scripts/build-prompts.mjs",
     "cf:dev": "wrangler dev",
     "cf:deploy": "npm run build && wrangler deploy",
     "cf:seed": "node scripts/seed-d1.mjs"

@@ -680,13 +680,13 @@ export const defaultModelsList: Model[] = rawModelsList.split('\n').filter(Boole
   }
   speed = Math.max(10, Math.min(100, speed));
 
-  let frontend = intelligence * 0.9;
-  let backend = intelligence * 0.95;
+  let frontend = intelligence * 0.85;
+  let backend = intelligence * 0.90;
   if (idLower.includes('claude') || idLower.includes('sonnet')) {
-    frontend = Math.min(100, intelligence * 1.05);
+    frontend = Math.min(98, intelligence * 0.98);
   }
-  if (idLower.includes('gpt-4') || idLower.includes('o1') || idLower.includes('o3')) {
-    backend = Math.min(100, intelligence * 1.05);
+  if (idLower.includes('gpt-4') || idLower.includes('o1') || idLower.includes('o3') || idLower.includes('deepseek')) {
+    backend = Math.min(98, intelligence * 0.98);
   }
 
   const comprehensiveScore = (intelligence * 0.5) + (speed * 0.3) + 10;
