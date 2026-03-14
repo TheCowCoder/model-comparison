@@ -1,12 +1,13 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { Link } from 'react-router-dom';
 import { useAppContext } from '../context/AppContext';
-import { ArrowLeft, Loader2, Search, Sparkles, Trophy, ChevronDown, X } from 'lucide-react';
+import { ArrowLeft, Loader2, Search, Sparkles, Trophy, ChevronDown, X, BookOpen } from 'lucide-react';
 import { parseLeaderboardQuery } from '../services/geminiService';
 import { parseScoreValue } from '../lib/appState';
 import { DEFAULT_RANKING_SORTS, filterModelsByLeaderboardRegex, leaderboardStatColumns, inferLeaderboardQueryFallback, queryImpliesRanking } from '../lib/leaderboard';
 import { DEFAULT_LEADERBOARD_SEARCH_MODEL, LEADERBOARD_SEARCH_MODEL_OPTIONS } from '../lib/searchModels';
 import { Benchmark, LeaderboardSortTarget, LeaderboardStatKey, Model } from '../types';
+import { getCopilotDescriptionForModel, matchModelsByCopilotDescriptions } from '../data/copilotModelDescriptions';
 
 type LeaderboardColumn =
   | { kind: 'stat'; id: LeaderboardStatKey; label: string; rank: number | null }
@@ -24,6 +25,8 @@ export default function LeaderboardView() {
   const [searchModel, setSearchModel] = useState<string>(DEFAULT_LEADERBOARD_SEARCH_MODEL);
   const [searchFilterLabel, setSearchFilterLabel] = useState<string | null>(null);
   const [searchFilteredCount, setSearchFilteredCount] = useState(0);
+  const [searchHighlightTerms, setSearchHighlightTerms] = useState<string[]>([]);
+  const [descriptionSources, setDescriptionSources] = useState<Array<{ model: string; snippet: string; matchedTerms: string[] }>>([]);
   const dropdownRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -96,7 +99,28 @@ export default function LeaderboardView() {
     setActiveSorts([]);
     setSearchFilterLabel(null);
     setSearchFilteredCount(0);
+    setSearchHighlightTerms([]);
+    setDescriptionSources([]);
     setFilteredModels(applyModelFilter(models, selectedModelIds));
+  };
+
+  const renderHighlightedText = (text: string, terms: string[]) => {
+    if (!text || terms.length === 0) return text;
+
+    const escaped = terms.map((term) => term.replace(/[.*+?^${}()|[\\]\\]/g, '\\$&'));
+    const regex = new RegExp(`(${escaped.join('|')})`, 'gi');
+    const parts = text.split(regex);
+
+    return parts.map((part, index) => {
+      const isMatch = terms.some((term) => term.toLowerCase() === part.toLowerCase());
+      if (!isMatch) return <React.Fragment key={index}>{part}</React.Fragment>;
+
+      return (
+        <mark key={index} className="rounded bg-yellow-200 px-0.5 text-yellow-900">
+          {part}
+        </mark>
+      );
+    });
   };
 
   const handleSearch = async (e: React.FormEvent) => {
@@ -124,9 +148,18 @@ export default function LeaderboardView() {
             : DEFAULT_RANKING_SORTS
           : [];
       
-      let newFilteredModels = filterModelsByLeaderboardRegex(models, result.modelRegex);
+      let newFilteredModels: Model[] = filterModelsByLeaderboardRegex(models, result.modelRegex) as Model[];
+      const descriptionMatches = matchModelsByCopilotDescriptions(searchQuery, models);
+      const hasDescriptionFilter = descriptionMatches.modelIds.size > 0;
+      if (hasDescriptionFilter) {
+        newFilteredModels = newFilteredModels.filter((model) => descriptionMatches.modelIds.has(model.id));
+      }
+
       if (result.modelRegex && newFilteredModels.length > 0 && newFilteredModels.length < models.length) {
         setSearchFilterLabel('AI filter applied');
+        setSearchFilteredCount(newFilteredModels.length);
+      } else if (hasDescriptionFilter && newFilteredModels.length > 0 && newFilteredModels.length < models.length) {
+        setSearchFilterLabel('Copilot description filter applied');
         setSearchFilteredCount(newFilteredModels.length);
       } else {
         setSearchFilterLabel(null);
@@ -142,13 +175,25 @@ export default function LeaderboardView() {
         setActiveSorts([]);
       }
 
+      setSearchHighlightTerms(descriptionMatches.terms);
+      setDescriptionSources(descriptionMatches.sources);
+
       setFilteredModels(newFilteredModels);
     } catch (error) {
       console.error("Search failed", error);
       const fallback = inferLeaderboardQueryFallback(searchQuery, models, benchmarks);
-      let newFilteredModels = filterModelsByLeaderboardRegex(models, fallback.modelRegex);
+      let newFilteredModels: Model[] = filterModelsByLeaderboardRegex(models, fallback.modelRegex) as Model[];
+      const descriptionMatches = matchModelsByCopilotDescriptions(searchQuery, models);
+      const hasDescriptionFilter = descriptionMatches.modelIds.size > 0;
+      if (hasDescriptionFilter) {
+        newFilteredModels = newFilteredModels.filter((model) => descriptionMatches.modelIds.has(model.id));
+      }
+
       if (fallback.modelRegex && newFilteredModels.length > 0 && newFilteredModels.length < models.length) {
         setSearchFilterLabel('AI filter applied');
+        setSearchFilteredCount(newFilteredModels.length);
+      } else if (hasDescriptionFilter && newFilteredModels.length > 0 && newFilteredModels.length < models.length) {
+        setSearchFilterLabel('Copilot description filter applied');
         setSearchFilteredCount(newFilteredModels.length);
       } else {
         setSearchFilterLabel(null);
@@ -161,6 +206,8 @@ export default function LeaderboardView() {
       } else {
         setActiveSorts([]);
       }
+      setSearchHighlightTerms(descriptionMatches.terms);
+      setDescriptionSources(descriptionMatches.sources);
       setFilteredModels(newFilteredModels);
     } finally {
       setIsSearching(false);
@@ -345,12 +392,32 @@ export default function LeaderboardView() {
           </div>
         )}
 
+        {descriptionSources.length > 0 && (
+          <div className="mb-4 rounded-xl border border-amber-200 bg-amber-50 p-4 text-amber-900">
+            <div className="mb-2 flex items-center gap-2">
+              <BookOpen size={16} className="text-amber-700" />
+              <span className="text-sm font-semibold">Natural-search sources (Copilot descriptions)</span>
+            </div>
+            <div className="space-y-1.5 text-sm">
+              {descriptionSources.map((source) => (
+                <div key={`${source.model}-${source.snippet}`}>
+                  <span className="font-semibold">{source.model}:</span>{' '}
+                  <span className="italic">{renderHighlightedText(source.snippet, searchHighlightTerms)}</span>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+
         <div className="bg-white border border-neutral-200 rounded-xl shadow-sm overflow-hidden flex flex-col">
           <div className="overflow-x-auto">
             <table className="w-full text-left border-collapse">
               <thead className="bg-neutral-100 shadow-sm">
                 <tr>
                   <th className="p-4 text-sm font-semibold text-neutral-600 border-b border-neutral-200 sticky left-0 bg-neutral-100 z-10">Model</th>
+                  <th className="p-4 text-sm font-semibold text-neutral-700 border-b border-neutral-200 bg-amber-50 min-w-[320px]">
+                    Copilot Model Description
+                  </th>
                   {visibleColumns.map(column => {
                     const isActive = column.rank !== null;
                     const headerClassName = column.kind === 'stat'
@@ -388,6 +455,13 @@ export default function LeaderboardView() {
                         </div>
                       </div>
                     </td>
+                    <td className="border-r border-neutral-100 bg-amber-50/50 p-4 text-sm text-neutral-800">
+                      {(() => {
+                        const description = getCopilotDescriptionForModel(model);
+                        if (!description) return '—';
+                        return renderHighlightedText(description, searchHighlightTerms);
+                      })()}
+                    </td>
                     {visibleColumns.map(column => {
                       const isActive = column.rank !== null;
                       if (column.kind === 'stat') {
@@ -411,7 +485,7 @@ export default function LeaderboardView() {
                 ))}
                 {filteredModels.length === 0 && (
                   <tr>
-                    <td colSpan={visibleColumns.length + 1} className="p-8 text-center text-neutral-500">
+                    <td colSpan={visibleColumns.length + 2} className="p-8 text-center text-neutral-500">
                       No models found matching your query.
                     </td>
                   </tr>

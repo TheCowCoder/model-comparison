@@ -6,6 +6,7 @@ import {
   LeaderboardStatKey,
   Model,
 } from '../types';
+import { getCopilotDescriptionForModel } from '../data/copilotModelDescriptions';
 
 export const leaderboardStatColumns: Array<{ key: LeaderboardStatKey; label: string; aliases: string[] }> = [
   { key: 'humanUnderstanding', label: 'Human Understanding', aliases: ['human understanding', 'understanding', 'human intelligence', 'human intellect', 'human intellegnece', 'human intelligencee'] },
@@ -78,7 +79,8 @@ function buildCompactModelRegex(terms: Array<string | null | undefined>) {
 }
 
 export function getLeaderboardModelSearchText(model: Pick<Model, 'id' | 'name' | 'subtitle'>) {
-  return normalizeText(`${model.id} ${model.name} ${model.subtitle || ''}`);
+  const copilotDescription = getCopilotDescriptionForModel({ id: model.id, name: model.name }) || '';
+  return normalizeText(`${model.id} ${model.name} ${model.subtitle || ''} ${copilotDescription}`);
 }
 
 export function filterModelsByLeaderboardRegex<T extends Pick<Model, 'id' | 'name' | 'subtitle'>>(models: T[], modelRegex: string | null | undefined) {

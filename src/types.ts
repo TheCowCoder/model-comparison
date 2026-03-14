@@ -48,6 +48,8 @@ export interface Model {
   color?: string;
   scores: Record<string, string>;
   stats?: ModelStats;
+  intelligenceCategories?: string[];
+  copilotDescription?: string;
 }
 
 export interface AppState {
